@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+psycopg2-binary
+pydantic[email]
+sqlalchemy
+pwdlib[argon2]
+PyJWT
+python-multipart
+pymupdf
+python-dotenv
