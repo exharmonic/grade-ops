@@ -1,14 +1,14 @@
 import os
 import base64
 import json
-import time
-from typing import Any, TypedDict
+import sqlite3
+from typing import Any, Literal, Optional, TypedDict
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
@@ -20,26 +20,59 @@ from pydantic import BaseModel, Field
 
 # PYDANTIC MODELS
 class RubricCriterionMatch(BaseModel):
-    name: str = Field(description="Name of the rubric criterion")
-    awarded: int = Field(description="Points awarded by the AI")
-    max: int = Field(description="Maximum points possible for this specific criterion")
-    status: str = Field(description="Must be strictly 'full', 'partial', or 'none'")
+    name: str = Field(
+        description="The exact name of the rubric criterion (e.g., 'Antiderivative setup')"
+    )
+    awarded: int = Field(description="Points awarded for this specific criterion")
+    max: int = Field(description="Maximum points possible for this criterion")
+    status: Literal["full", "partial", "none"] = Field(
+        description="Calculated status based on awarded vs max"
+    )
+
+
+class SimilarityFlagData(BaseModel):
+    count: int = Field(description="Number of similar papers found")
+    papers: list[str] = Field(description="List of student IDs with similar logic")
+
+
+class RubricCriterion(BaseModel):
+    name: str = Field(description="Name of the criterion")
+    maxPoints: int = Field(description="Maximum points possible")
+    keywords: list[str] = Field(description="Keywords to look for")
 
 
 class QuestionGradingResult(BaseModel):
-    questionRef: str = Field(
-        description="The ID of the question currently being evaluated"
+    id: str = Field(
+        description="Unique ID for this specific UI card (e.g., 'q1', 'q2')"
     )
-    aiScore: int = Field(description="Points alloted by AI for this question")
+    studentId: str = Field(description="The student's ID/Roll number")
+    questionRef: str = Field(
+        description="The ID of the question from the rubric (e.g., 'Q3b')"
+    )
+    questionText: str = Field(description="The full text of the question")
+    rubric: list[RubricCriterion] = Field(
+        description="The original rubric criteria used for grading"
+    )
+    ocrText: str = Field(
+        description="The exact mathematical text/steps extracted from the student's upload"
+    )
+    ocrConfidence: float = Field(
+        default=95.0, description="Estimated confidence in the text extraction"
+    )
+    aiScore: int = Field(description="Total points awarded (sum of all rubric matches)")
+    maxScore: int = Field(description="Total possible points for the whole question")
     aiJustification: str = Field(
-        description="Detailed text breakdown explaining why points were awarded or cut"
+        description="A holistic paragraph explaining the deductions and final score"
     )
     rubricMatch: list[RubricCriterionMatch] = Field(
-        description="Array breaking down points per criterion"
+        description="Granular breakdown of points awarded per criterion"
     )
     confidence: int = Field(
-        description="AI confidence score from 0 to 100 for this evaluation"
+        description="AI confidence in this grading decision (0-100)"
     )
+    status: str = Field(default="pending")
+    timeAgo: str = Field(default="Just now")
+    similarityFlag: Optional[SimilarityFlagData] = Field(default=None)
 
 
 class FullExamGradingResult(BaseModel):
@@ -51,6 +84,7 @@ class FullExamGradingResult(BaseModel):
 # STATE SCHEMA
 class GradingState(TypedDict):
     submission_id: int
+    student_id: str
     page_img_paths: list[str]
     rubric: dict[str, Any]
     ocr_text: str
@@ -111,50 +145,22 @@ def run_nemotron_ocr_node(state: GradingState):
 
 def human_intervention_decider(state: GradingState):
     print("--- Waiting for Human Review of AI Grading ---")
-    human_review = interrupt(
-        {
-            "message": "Please review the AI grading results.",
-            "ai_score": state.get("detailed_analysis", {})
-            .get("questions", [{}])[0]
-            .get("aiScore"),
-            "ai_justification": state.get("detailed_analysis", {})
-            .get("questions", [{}])[0]
-            .get("aiJustification"),
-            "full_json": state.get("detailed_analysis", {}),
-        }
-    )
 
-    action = human_review.get("action").lower().strip()
+    ui_payload = state.get("detailed_analysis", {})
+    human_review = interrupt(ui_payload)
 
-    if action == "approve":
-        return {"status": "approved"}
-    elif action == "override":
-        q_ref = human_review.get("q_ref")
-        new_score = human_review.get("new_score")
-        reason = human_review.get("reason", "No reason provided.")
+    return {
+        "status": "approved",
+        "detailed_analysis": {"questions": human_review.get("questions", [])},
+    }
 
-        updated_analysis = state.get("detailed_analysis", {})
-
-        question_found = False
-        for q_dict in updated_analysis.get("questions", []):
-            if q_dict.get("questionRef") == q_ref:
-                q_dict["aiScore"] = int(new_score)
-                original_justification = q_dict.get("aiJustification", "")
-                q_dict["aiJustification"] = f"[TA OVERRIDE]: {reason} \n(Original AI Logic: {original_justification})"
-                question_found = True
-                break
-        if not question_found:
-            print("No question found to override.")
-
-        return {
-            "status": "overriden",
-            "detailed_analysis": updated_analysis,
-        }
 
 def grade_with_gemini_model(state: GradingState):
     print("--- [NODE 2] GRADING ANSWER SCRIPT USING GEMINI ---")
 
-    gemini_model = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0.0)
+    gemini_model = ChatGoogleGenerativeAI(
+        model="gemini-3.1-flash-lite", temperature=0.0
+    )
 
     structured_gemini = gemini_model.with_structured_output(FullExamGradingResult)
 
@@ -162,11 +168,29 @@ def grade_with_gemini_model(state: GradingState):
         [
             (
                 "system",
-                "You are an elite, objective university grading assistant. Evaluate the provided student exam transcription strictly against the provided rubric configuration. Identify which question is being answered, calculate points cleanly, and output structured JSON matching the requested schema exactly.",
+                """You are an expert Teaching Assistant grading a university exam. 
+                You will receive the Student ID, the Extracted OCR Text of their answer, and a Granular Rubric.
+                
+                INSTRUCTIONS FOR NEW RUBRIC SYSTEM:
+                1. For each question, evaluate the student's answer against the array of specific rubric criteria.
+                2. For each criterion (e.g., 'Justification quality'), determine the points `awarded` out of the `maxPoints`.
+                3. Calculate the `status` for each criterion:
+                - 'full' if awarded == max
+                - 'partial' if 0 < awarded < max
+                - 'none' if awarded == 0
+                4. Calculate the overall `aiScore` by summing the awarded points from the `rubricMatch` array.
+                5. Provide a cohesive `aiJustification` summarizing why points were awarded or deducted across the criteria.
+                """,
             ),
             (
-                "human",
-                "RUBRIC CONFIGURATION:\n{rubric}\n\nSTUDENT EXAM TRANSCRIPTION:\n{ocr_text}",
+                "user",
+                """
+                Student ID: {student_id}
+                Exam Rubric: {rubric}
+                Extracted Student Answer: {ocr_text}
+            
+                Analyze the answer and provide the grading payload.
+                """,
             ),
         ]
     )
@@ -175,20 +199,17 @@ def grade_with_gemini_model(state: GradingState):
 
     try:
         result = grading_chain.invoke(
-            {"rubric": json.dumps(state["rubric"]), "ocr_text": state["ocr_text"]}
+            {
+                "rubric": json.dumps(state["rubric"]),
+                "student_id": state["student_id"],
+                "ocr_text": state["ocr_text"],
+            }
         )
         return {"detailed_analysis": result.model_dump(), "status": "pipeline_complete"}
     except Exception as e:
         print(f"Error during Gemini Grading: {e}")
         return {"status": "error_grading"}
-
-
-# def feeedback_router(state: GradingState) -> str:
-#     if state["status"] == "approved":
-#         return END
-#     if state["status"] == "feeedback":
-#         return "gemini_grader"
-
+    
 
 builder = StateGraph(GradingState)
 
@@ -200,45 +221,9 @@ builder.set_entry_point("nemotron_ocr")
 builder.add_edge("nemotron_ocr", "gemini_grader")
 builder.add_edge("gemini_grader", "human_intervention")
 builder.add_edge("human_intervention", END)
-# builder.add_conditional_edges(
-#     "human_intervention", feeedback_router, {END: END, "gemini_grader": "gemini_grader"}
-# )
-# builder.add_edge("gemini_grader", END)
 
-memory = MemorySaver()
+conn = sqlite3.connect("checkpoints.db", check_same_thread=False)
+memory = SqliteSaver(conn)
+memory.setup()
 
 graph = builder.compile(checkpointer=memory)
-
-# Local testing
-
-# if __name__ == "__main__":
-
-#     initial_state = {
-#         "submission_id": 1,
-#         "page_img_paths": [
-#             "uploads/exams/exam_1/images/Adobe_Scan_11_Jun_2026/page-2.png"
-#         ],
-#         "rubric": {
-#             "exam": "CS301 Midterm",
-#             "questions": [
-#                 {
-#                     "id": "Q1",
-#                     "text": "Explain time complexity of quicksort.",
-#                     "points": 10,
-#                     "keywords": ["O(n log n)", "average case", "pivot"],
-#                     "partial_credit": True,
-#                 }
-#             ],
-#         },
-#         "ocr_text": "",
-#         "detailed_analysis": {},
-#         "status": "started",
-#     }
-#     print("Initializing GradeOps AI Pipeline...")
-#     start_time = time.perf_counter()
-#     final_state = graph.invoke(initial_state)
-#     end_time = time.perf_counter()
-
-#     print("\n\n=== FINAL GRADED OUTPUT ===")
-#     print(json.dumps(final_state.get("detailed_analysis", {}), indent=2))
-#     print(f"Time taken to execute: {end_time-start_time:.6f} seconds")

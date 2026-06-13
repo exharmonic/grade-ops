@@ -24,7 +24,6 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)):
     credential_error = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials!")
 
     token = request.cookies.get("access_token")
-    print(f"oauth2 {token}")
     if token is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     

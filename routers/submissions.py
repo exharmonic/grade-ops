@@ -1,10 +1,19 @@
-from fastapi import APIRouter, Depends,File, UploadFile, Form, HTTPException, status, BackgroundTasks
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    UploadFile,
+    Form,
+    HTTPException,
+    status,
+    BackgroundTasks,
+)
 import app.models as models
 from app.auth import get_current_user
 from app.database import SessionLocal
 from typing import Annotated, List
 from app.database import get_db
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from ai_engine.graph import graph
 from langgraph.types import Command
 import app.schemas as schemas
@@ -19,6 +28,7 @@ router = APIRouter(prefix="/upload", tags=["Upload"])
 
 def secure_filename(filename: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(filename))
+
 
 @router.post("/")
 def upload_files(
@@ -76,9 +86,7 @@ def upload_files(
                     os.remove(existing_submission.pdf_path)
                 db.delete(existing_submission)
                 db.flush()
-            else:
-                net_new_students_count+=1
-            
+
             new_submission = models.Submission(
                 student_roll_no=student_id,
                 pdf_path=pdf_destination,
@@ -86,7 +94,7 @@ def upload_files(
                 ai_score=None,
                 ai_justification=None,
                 exam_id=exam_id,
-                status="processing"
+                status="processing",
             )
             db.add(new_submission)
             db.flush()
@@ -106,9 +114,7 @@ def upload_files(
 
             background_tasks.add_task(execute_grading_pipeline, current_sub_id)
 
-        exam.scripts += net_new_students_count
         db.commit()
-
 
     except Exception as error:
         db.rollback()
@@ -138,41 +144,62 @@ def upload_files(
         "students_processed": net_new_students_count,
     }
 
+
 @router.get("/{submission_id}/review")
 def get_human_review_data(submission_id: int, db: Session = Depends(get_db)):
 
-    submission = db.query(models.Submission).filter(models.Submission.id == submission_id).first()
+    submission = (
+        db.query(models.Submission)
+        .filter(models.Submission.id == submission_id)
+        .first()
+    )
+
+    if not submission:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found"
+        )
 
     if submission.status != "pending_review":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Submission is not ready for review")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Submission is not ready for review",
+        )
 
     config = {"configurable": {"thread_id": f"submission_{submission.id}"}}
 
     paused_state = graph.get_state(config)
 
     if not paused_state.tasks or not paused_state.tasks[0].interrupts:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Graph state lost or not found")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Graph state lost or not found",
+        )
 
     ui_payload = paused_state.tasks[0].interrupts[0].value
 
-    return {
-        "submission_id": submission.id,
-        "ai_review_data": ui_payload
-    }
+    return {"submission_id": submission.id, "ai_review_data": ui_payload}
+
 
 @router.post("/{submission_id}/review")
 def submit_human_review(
-    submission_id: int, 
-    payload: schemas.TAActionPayload, 
-    db: db_dependency
+    submission_id: int, payload: schemas.TAReviewSubmit, db: db_dependency
 ):
-    submission = db.query(models.Submission).filter(models.Submission.id == submission_id).first()
-    
+    submission = (
+        db.query(models.Submission)
+        .filter(models.Submission.id == submission_id)
+        .first()
+    )
+
     if not submission:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found."
+        )
 
     if submission.status != "pending_review":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Submission is not pending review.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Submission is not pending review.",
+        )
 
     config = {"configurable": {"thread_id": f"submission_{submission.id}"}}
 
@@ -180,23 +207,72 @@ def submit_human_review(
         final_state = graph.invoke(Command(resume=payload.model_dump()), config=config)
 
         if final_state:
-            graph_status = final_state.get("status")
             final_json = final_state.get("detailed_analysis", {})
             total_score = 0
             for q in final_json.get("questions", []):
                 total_score += int(q.get("aiScore", 0))
-            
+
             submission.ai_score = total_score
-            submission.ai_justification = str(final_json)
+            submission.ai_justification = json.dumps(final_json)
             submission.status = "completed"
             db.commit()
-            return {"message": "Grading finalized successfully.", "final_score": total_score}
+            return {
+                "message": "Grading finalized successfully.",
+                "final_score": total_score,
+            }
     except Exception as e:
         db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail=f"Failed to resume graph: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to resume graph: {str(e)}",
         )
+
+@router.get("/instructor_exams")
+def get_student_grades(current_user: user_dependency, db: db_dependency):
+
+    submissions = (
+        db.query(models.Submission)
+        .join(models.Exam, models.Submission.exam_id == models.Exam.id)
+        .filter(models.Exam.instructor_id == current_user.id)
+        .options(joinedload(models.Submission.exam))
+        .all()
+    )
+    
+    exam_total_possible_marks = {}
+
+    if not submissions:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No submissions found for this instructor",
+        )
+
+    results = []
+    for submission in submissions:
+        exam_id = submission.exam_id
+
+        if exam_id not in exam_total_possible_marks:
+            calculated_total = 0
+            if submission.exam and submission.exam.rubric:
+                questions = submission.exam.rubric.get("questions", [])
+                for q in questions:
+                    for criteria in q.get("criteria", []):
+                        calculated_total += int(criteria.get("maxPoints", 0))
+            
+            exam_total_possible_marks[exam_id] = calculated_total
+
+
+        results.append(
+            {
+                "id": submission.student_roll_no,
+                "exam": submission.exam.title,
+                "score": submission.ai_score,
+                "max": exam_total_possible_marks[exam_id],
+                "released": False,
+            }
+        )
+
+    return results
+
 
 async def execute_grading_pipeline(submission_id: int):
     db = SessionLocal()
@@ -206,11 +282,17 @@ async def execute_grading_pipeline(submission_id: int):
             .filter(models.Submission.id == submission_id)
             .first()
         )
-        if not submission: return
+        if not submission:
+            return
 
         initial_state = {
             "submission_id": submission.id,
-            "page_img_paths": [os.path.join(submission.images_path, f) for f in os.listdir(submission.images_path) if f.lower().endswith(".png")],
+            "student_id": submission.student_roll_no,
+            "page_img_paths": [
+                os.path.join(submission.images_path, f)
+                for f in os.listdir(submission.images_path)
+                if f.lower().endswith(".png")
+            ],
             "rubric": submission.exam.rubric,
             "ocr_text": "",
             "detailed_analysis": {},
@@ -221,12 +303,22 @@ async def execute_grading_pipeline(submission_id: int):
         config = {"configurable": {"thread_id": f"submission_{submission.id}"}}
         final_state = graph.invoke(initial_state, config=config)
 
-        submission.status = "pending_review"
-        print(json.dumps(final_state.get("detailed_analysis", {}), indent=2))
+        current_graph_state = graph.get_state(config)
+
+        if current_graph_state.tasks and current_graph_state.tasks[0].interrupts:
+            submission.status = "pending_review"
+            print(f"Submission {submission.id} successfully queued for TA review.")
+        else:
+            submission.status = "error"
+            print(
+                f"PIPELINE FAILED or skipped interrupt for sub {submission.id}. Final state: {final_state.get('status')}"
+            )
+
         db.commit()
 
     except Exception as e:
         print(f"Pipeline error: {e}")
+        submission.status = "error"
         db.commit()
     finally:
         db.close()

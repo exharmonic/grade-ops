@@ -36,7 +36,7 @@ class Exam_Instructor_Response(BaseModel):
     uploaded: str
     scripts: int
     graded: int
-    status: str= Field(..., pattern="^(Completed|In Review|Processing)")
+    status: str= Field(..., pattern="^(completed|in_review|processing|pending_review)")
 
     @field_validator('uploaded', mode='before')
     def format_date(cls, value):
@@ -58,8 +58,5 @@ class SubmissionResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes = True)
 
-class TAActionPayload(BaseModel):
-    action: str
-    q_ref: str | None = None
-    new_score: int | None = None
-    reason: str | None = None 
+class TAReviewSubmit(BaseModel):
+    questions: list[Any]

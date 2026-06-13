@@ -2,3 +2,7 @@
 __pycache__/
 .venv/
 uploads/
+
+checkpoints.db
+checkpoints.db-shm
+checkpoints.db-wal
