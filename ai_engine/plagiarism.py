@@ -4,8 +4,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from pydantic import BaseModel, Field
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from ai_engine.graph import builder
 from app.database import SessionLocal
 import app.models as models
 
@@ -26,9 +24,6 @@ evaluator = evaluator_llm.with_structured_output(PlagiarismDecision)
 async def check_suspicious_pair(
     question_text: str, ans_a: str, ans_b: str, sem: asyncio.Semaphore
 ) -> bool:
-    """Uses an LLM to distinguish between actual plagiarism and standard mathematical proofs/MCQs."""
-
-    # Fast-fail for tiny answers (like "A" or "42")
     if len(ans_a) < 30 and len(ans_b) < 30:
         return False
 
@@ -36,18 +31,26 @@ async def check_suspicious_pair(
         [
             (
                 "system",
-                """You are an academic integrity AI. Two students have highly similar answers. 
-                Determine if this similarity is SUSPICIOUS or EXPECTED.
-                
-                EXPECTED (Return False):
-                - Single-option/MCQ answers.
-                - Standard mathematical proofs or derivations where only one logical path exists.
-                - Simple arithmetic where steps are universally identical.
-                
-                SUSPICIOUS (Return True):
-                - Matching idiosyncratic phrasing or highly unique explanations.
-                - Matching identical, highly specific mathematical mistakes.
-                - Copied text that goes beyond standard formulas.
+                """You are an academic integrity AI. Two students have submitted answers with high textual similarity.
+                Your job is to determine if this similarity indicates COPYING or INDEPENDENT WORK.
+
+                The key question is NOT whether the topic has a standard answer.
+                The key question IS: could two students independently produce this level of textual similarity?
+
+                INDEPENDENT / EXPECTED (Return False):
+                - Answers that are similar in content but differ in wording, notation, or structure.
+                - MCQ or fill-in answers where only one token is the answer (e.g., "A", "True", "42").
+                - Simple one-line arithmetic where no other phrasing is possible.
+
+                SUSPICIOUS / COPYING (Return True):
+                - Answers that are verbatim or near-verbatim, even if the math itself is standard.
+                (Two students can both know how to integrate sin(x) without copying each other word for word.)
+                - Matching unconventional notation, formatting, or layout choices.
+                - Matching errors, crossed-out work, or partial mistakes.
+                - Identical sentence structure and phrasing in written explanations.
+                - Answers where the only plausible explanation for the similarity is that one student copied from the other.
+
+                When in doubt about verbatim or near-verbatim matches: return True.
                 """,
             ),
             ("user", "Question: {q}\n\nStudent 1: {a}\n\nStudent 2: {b}"),
@@ -69,57 +72,60 @@ async def run_batch_plagiarism_check(exam_id: int):
     print(f"--- Starting Plagiarism Check for Exam {exam_id} ---")
     db = SessionLocal()
 
-    pending_subs = (
-        db.query(models.Submission)
-        .filter(
-            models.Submission.exam_id == exam_id,
-            models.Submission.status == "pending_review",
+    try:
+        pending_subs = (
+            db.query(models.Submission)
+            .filter(
+                models.Submission.exam_id == exam_id,
+                models.Submission.status == "pending_review",
+            )
+            .all()
         )
-        .all()
-    )
 
-    db.close()
+        if len(pending_subs) < 2:
+            print("Not enough submissions to compare, skipping.")
+            return {
+                "status": "skipped",
+                "message": "Not enough submissions to compare.",
+            }
 
-    if len(pending_subs) < 2:
-        return {"status": "skipped", "message": "Not enough submissions to compare."}
-
-    q_data = {}
-
-    async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
-        graph = builder.compile(checkpointer=memory)
+        q_data = {}
 
         for sub in pending_subs:
-            config = {"configurable": {"thread_id": f"submission_{sub.id}"}}
-            state = await graph.aget_state(config)
+            if not sub.ai_justification:
+                print(f"Sub {sub.id}: ai_justification is empty, skipping")
+                continue
+            payload = json.loads(sub.ai_justification)
+            print(f"Sub {sub.id} payload keys: {list(payload.keys())}")
+            print(f"Sub {sub.id} questions sample: {payload.get('questions', [])[:1]}")
+            questions = payload.get("questions", [])
+            for q in questions:
+                q_ref = q["questionRef"]
+                if q_ref not in q_data:
+                    q_data[q_ref] = []
+                q_data[q_ref].append(
+                    {
+                        "sub_id": sub.id,
+                        "student_id": q["studentId"],
+                        "ocr_text": q["ocrText"],
+                        "q_text": q["questionText"],
+                    }
+                )
 
-            if state.tasks and state.tasks[0].interrupts:
-                questions = state.tasks[0].interrupts[0].value.get("questions", [])
-                for q in questions:
-                    q_ref = q["questionRef"]
-                    if q_ref not in q_data:
-                        q_data[q_ref] = []
+    finally:
+        db.close()
 
-                    q_data[q_ref].append(
-                        {
-                            "sub_id": sub.id,
-                            "student_id": q["studentId"],
-                            "ocr_text": q["ocrText"],
-                            "q_text": q["questionText"],
-                        }
-                    )
-
-    final_flags = {}  # Format: { sub_id: { q_ref: { count: 1, papers: ["S101"] } } }
+    final_flags = {}
     sem = asyncio.Semaphore(5)
 
     for q_ref, students in q_data.items():
-        # Filtering out empty answers before comparing
         valid_students = [s for s in students if len(s["ocr_text"].strip()) > 5]
         if len(valid_students) < 2:
             continue
 
         texts = [s["ocr_text"] for s in valid_students]
         try:
-            vectors = embeddings_model.embed_documents(texts)
+            vectors = await embeddings_model.aembed_documents(texts)
         except Exception as e:
             print(f"Embedding API failed for question {q_ref}: {e}")
             continue

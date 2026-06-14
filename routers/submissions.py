@@ -41,7 +41,6 @@ def upload_files(
     files: List[UploadFile] = File(...),
     exam_id: int = Form(...),
 ):
-
     if current_user.role != "instructor":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -154,7 +153,6 @@ def upload_files(
 async def get_human_review_data(
     submission_id: int, current_user: user_dependency, db: Session = Depends(get_db)
 ):
-
     if current_user.role != "ta":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -248,7 +246,6 @@ async def submit_human_review(
     payload: schemas.TAReviewSubmit,
     db: db_dependency,
 ):
-
     if current_user.role != "ta":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -306,7 +303,6 @@ async def submit_human_review(
 
 @router.get("/instructor_exams")
 def get_student_grades(current_user: user_dependency, db: db_dependency):
-
     submissions = (
         db.query(models.Submission)
         .join(models.Exam, models.Submission.exam_id == models.Exam.id)
@@ -366,7 +362,10 @@ async def execute_grading_pipeline(submission_id: int):
             "student_id": submission.student_roll_no,
             "page_img_paths": [
                 os.path.join(submission.images_path, f)
-                for f in os.listdir(submission.images_path)
+                for f in sorted(
+                    os.listdir(submission.images_path),
+                    key=lambda n: int(re.sub(r"\D", "", n) or 0),
+                )
                 if f.lower().endswith(".png")
             ],
             "rubric": submission.exam.rubric,
@@ -375,25 +374,22 @@ async def execute_grading_pipeline(submission_id: int):
             "status": "processing",
             "feedback": "",
         }
-
         config = {"configurable": {"thread_id": f"submission_{submission.id}"}}
 
         async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
             await memory.setup()
             graph = builder.compile(checkpointer=memory)
-
             final_state = await graph.ainvoke(initial_state, config=config)
-
             current_graph_state = await graph.aget_state(config)
 
             if current_graph_state.tasks and current_graph_state.tasks[0].interrupts:
+                interrupt_payload = current_graph_state.tasks[0].interrupts[0].value
                 submission.status = "pending_review"
+                submission.ai_justification = json.dumps(interrupt_payload)
                 print(f"Submission {submission.id} successfully queued for TA review.")
             else:
                 submission.status = "error"
-                print(
-                    f"PIPELINE FAILED or skipped interrupt for sub {submission.id}. Final state: {final_state.get('status')}"
-                )
+                print(f"PIPELINE FAILED or skipped interrupt for sub {submission.id}.")
 
         db.commit()
 
@@ -407,11 +403,20 @@ async def execute_grading_pipeline(submission_id: int):
         )
 
         if remaining_processing == 0:
-            print(
-                f"All scripts for Exam {submission.exam_id} have finished processing!"
+            rows_updated = (
+                db.query(models.Exam)
+                .filter(
+                    models.Exam.id == submission.exam_id,
+                    models.Exam.plagiarism_checked == False,
+                )
+                .update({"plagiarism_checked": True})
             )
-            print("Automatically triggering batch plagiarism check...")
-            await run_batch_plagiarism_check(submission.exam_id)
+            db.commit()
+
+            if rows_updated > 0:
+                print(f"All scripts for Exam {submission.exam_id} have finished processing!")
+                print("Automatically triggering batch plagiarism check...")
+                await run_batch_plagiarism_check(submission.exam_id)
 
     except Exception as e:
         print(f"Pipeline error: {e}")

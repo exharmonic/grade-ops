@@ -1,5 +1,5 @@
 from app.database import Base
-from sqlalchemy import Column, Integer, String, JSON, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, String, JSON, ForeignKey, DateTime, Boolean, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -17,6 +17,7 @@ class Exam(Base):
     id = Column(Integer, primary_key=True, nullable=False)
     title = Column(String, nullable=False)
     rubric = Column(JSON, nullable=False) 
+    plagiarism_checked = Column(Boolean, nullable=False, server_default=text('false'))
     instructor_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     uploaded = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     status = Column(String, nullable=False, server_default="Processing")
