@@ -107,6 +107,97 @@ async def get_instructor_exams(
     return results
 
 
+@router.get("/to-grade", response_model=list[schemas.ExamToGradeResponse])
+async def get_exams_to_grade(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    exam_ids = [
+        row[0]
+        for row in db.query(models.Submission.exam_id)
+        .filter(models.Submission.status == "pending_review")
+        .distinct()
+        .all()
+    ]
+
+    if not exam_ids:
+        return []
+
+    exams = db.query(models.Exam).filter(models.Exam.id.in_(exam_ids)).all()
+
+    results = []
+    for exam in exams:
+        total = (
+            db.query(models.Submission)
+            .filter(models.Submission.exam_id == exam.id)
+            .count()
+        )
+        pending = (
+            db.query(models.Submission)
+            .filter(
+                models.Submission.exam_id == exam.id,
+                models.Submission.status == "pending_review",
+            )
+            .count()
+        )
+        graded = (
+            db.query(models.Submission)
+            .filter(
+                models.Submission.exam_id == exam.id,
+                models.Submission.status == "completed",
+            )
+            .count()
+        )
+        results.append(
+            {
+                "id": exam.id,
+                "title": exam.title,
+                "pending": pending,
+                "total": total,
+                "graded": graded,
+                "uploaded": exam.uploaded,
+            }
+        )
+
+    return results
+
+
+@router.patch("/{exam_id}/", response_model=schemas.ExamResponse)
+async def update_exam(
+    exam_id: int,
+    exam_update: schemas.ExamUpdate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role != "instructor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only instructors can edit exams",
+        )
+
+    exam = db.query(models.Exam).filter(models.Exam.id == exam_id).first()
+
+    if exam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No exam found"
+        )
+
+    if exam.instructor_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only edit your own exams",
+        )
+
+    update_data = exam_update.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(exam, field, value)
+
+    db.commit()
+    db.refresh(exam)
+
+    return exam
+
+
 @router.delete("/{exam_id}/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_exam(
     exam_id: int,
@@ -139,13 +230,18 @@ async def delete_exam(
     db.delete(exam)
     db.commit()
 
+
 @router.get("/{exam_id}/queue")
 def get_exam_review_queue(exam_id: int, db: Session = Depends(get_db)):
-    
-    pending_subs = db.query(models.Submission).filter(
-        models.Submission.exam_id == exam_id,
-        models.Submission.status == "pending_review"
-    ).all()
+
+    pending_subs = (
+        db.query(models.Submission)
+        .filter(
+            models.Submission.exam_id == exam_id,
+            models.Submission.status == "pending_review",
+        )
+        .all()
+    )
 
     master_queue = []
 
@@ -158,9 +254,11 @@ def get_exam_review_queue(exam_id: int, db: Session = Depends(get_db)):
             questions = ui_payload.get("questions", [])
 
             for q in questions:
-                q["submission_id"] = sub.id  
+                q["submission_id"] = sub.id
                 master_queue.append(q)
         else:
-            print(f"Submission {sub.id} is 'pending' in DB, but missing from LangGraph RAM!")
+            print(
+                f"Submission {sub.id} is 'pending' in DB, but missing from LangGraph RAM!"
+            )
 
     return {"queue": master_queue}

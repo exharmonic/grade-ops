@@ -227,6 +227,7 @@ def submit_human_review(
             detail=f"Failed to resume graph: {str(e)}",
         )
 
+
 @router.get("/instructor_exams")
 def get_student_grades(current_user: user_dependency, db: db_dependency):
 
@@ -237,7 +238,7 @@ def get_student_grades(current_user: user_dependency, db: db_dependency):
         .options(joinedload(models.Submission.exam))
         .all()
     )
-    
+
     exam_total_possible_marks = {}
 
     if not submissions:
@@ -257,9 +258,8 @@ def get_student_grades(current_user: user_dependency, db: db_dependency):
                 for q in questions:
                     for criteria in q.get("criteria", []):
                         calculated_total += int(criteria.get("maxPoints", 0))
-            
-            exam_total_possible_marks[exam_id] = calculated_total
 
+            exam_total_possible_marks[exam_id] = calculated_total
 
         results.append(
             {

@@ -5,9 +5,7 @@ import os
 DATABASE_URL = os.getenv("SQLALCHEMY_DATABASE_URL")
 
 if DATABASE_URL is None:
-    raise ValueError(
-        "THERE WAS A PROBLEM TRYING TO FETCH THE DATABASE_URL."
-    )
+    raise ValueError("THERE WAS A PROBLEM TRYING TO FETCH THE DATABASE_URL.")
 
 engine = create_engine(os.getenv("SQLALCHEMY_DATABASE_URL"))
 
