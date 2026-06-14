@@ -6,7 +6,7 @@ import app.models as models
 from app.database import get_db
 from app.auth import get_current_user
 import app.schemas as schemas
-import os, shutil
+import os, shutil, json
 
 router = APIRouter(prefix="/exams", tags=["Exams"])
 
@@ -233,7 +233,7 @@ async def delete_exam(
 
 
 @router.get("/{exam_id}/queue")
-async def get_exam_review_queue(exam_id: int, db: Session = Depends(get_db)): # Added async
+async def get_exam_review_queue(exam_id: int, db: Session = Depends(get_db)):
 
     pending_subs = (
         db.query(models.Submission)
@@ -246,13 +246,18 @@ async def get_exam_review_queue(exam_id: int, db: Session = Depends(get_db)): # 
 
     master_queue = []
 
+    flag_file = f"uploads/exams/exam_{exam_id}/plagiarism.json"
+    plagiarism_data = {}
+    if os.path.exists(flag_file):
+        with open(flag_file, "r") as f:
+            plagiarism_data = json.load(f)
+
     async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
         graph = builder.compile(checkpointer=memory)
-        
+
         for sub in pending_subs:
             config = {"configurable": {"thread_id": f"submission_{sub.id}"}}
-            
-            paused_state = await graph.aget_state(config) 
+            paused_state = await graph.aget_state(config)
 
             if paused_state.tasks and paused_state.tasks[0].interrupts:
                 ui_payload = paused_state.tasks[0].interrupts[0].value
@@ -260,6 +265,11 @@ async def get_exam_review_queue(exam_id: int, db: Session = Depends(get_db)): # 
 
                 for q in questions:
                     q["submission_id"] = sub.id
+
+                    sub_flags = plagiarism_data.get(str(sub.id), {})
+                    if q["questionRef"] in sub_flags:
+                        q["similarityFlag"] = sub_flags[q["questionRef"]]
+
                     master_queue.append(q)
             else:
                 print(

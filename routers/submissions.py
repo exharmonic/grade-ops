@@ -18,8 +18,9 @@ from ai_engine.graph import builder
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 import app.schemas as schemas
+from ai_engine.plagiarism import run_batch_plagiarism_check
 import os, shutil, re, pymupdf
-import json
+import json, asyncio
 
 db_dependency = Annotated[Session, Depends(get_db)]
 user_dependency = Annotated[models.User, Depends(get_current_user)]
@@ -328,6 +329,22 @@ async def execute_grading_pipeline(submission_id: int):
                 )
 
         db.commit()
+
+        remaining_processing = (
+            db.query(models.Submission)
+            .filter(
+                models.Submission.exam_id == submission.exam_id,
+                models.Submission.status == "processing",
+            )
+            .count()
+        )
+
+        if remaining_processing == 0:
+            print(
+                f"All scripts for Exam {submission.exam_id} have finished processing!"
+            )
+            print("Automatically triggering batch plagiarism check...")
+            asyncio.create_task(run_batch_plagiarism_check(submission.exam_id))
 
     except Exception as e:
         print(f"Pipeline error: {e}")
