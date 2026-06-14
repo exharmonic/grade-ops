@@ -75,11 +75,6 @@ With the virtual environment active, run:
 pip install -r requirements.txt
 ```
 
-> Note: the AI pipeline also relies on LangGraph and the LangChain provider packages, which are imported by the orchestration code. If they are not yet pinned in `requirements.txt`, install them as well so the server can start:
-> ```bash
-> pip install langgraph langgraph-checkpoint-sqlite langchain-google-genai langchain-openai
-> ```
-
 ### 4. Configure environment variables
 For security, secrets are not committed to the repository. They are read from a `.env` file instead.
 
